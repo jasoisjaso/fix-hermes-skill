@@ -26,6 +26,7 @@ err(){  printf '  \033[31mx\033[0m %s\n' "$1"; }
 hdr(){  printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
 FAIL=0; RESTART=0
+grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=1 || IS_WSL=0
 
 hdr "1. claude.ai identity (must be claude.ai / firstParty / max)"
 AS="$(HOME="$HOME" claude auth status 2>/dev/null)"
@@ -76,18 +77,49 @@ else
 fi
 
 hdr "5. Meridian freshness (must have started AFTER last re-auth)"
-if systemctl --user is-active meridian >/dev/null 2>&1; then
-  ms=$(date -d "$(systemctl --user show meridian -p ActiveEnterTimestamp --value)" +%s 2>/dev/null || echo 0)
-  cs=$([ -f "$CREDS" ] && stat -c %Y "$CREDS" || echo 0)
-  if [ "$cs" -gt "$ms" ]; then warn "credentials ($(date -d @$cs '+%H:%M:%S')) newer than Meridian start ($(date -d @$ms '+%H:%M:%S')) — stale creds; will restart"; RESTART=1
-  else ok "Meridian started after the current credentials"; fi
+if [ "$IS_WSL" = 1 ]; then
+  # On WSL, systemctl --user is unavailable from non-login shells — check via pgrep instead
+  if pgrep -f "\.npm-global/bin/meridian" >/dev/null 2>&1; then
+    ms=$(stat -c %Y /proc/$(pgrep -f "\.npm-global/bin/meridian" | head -1) 2>/dev/null || echo 0)
+    cs=$([ -f "$CREDS" ] && stat -c %Y "$CREDS" || echo 0)
+    if [ "$cs" -gt "$ms" ]; then warn "credentials newer than running Meridian — stale creds; will restart"; RESTART=1
+    else ok "Meridian running and started after current credentials (WSL direct)"; fi
+  else
+    warn "Meridian not running — will start it (WSL direct)"; RESTART=1
+  fi
 else
-  warn "Meridian not active — will start it"; RESTART=1
+  if systemctl --user is-active meridian >/dev/null 2>&1; then
+    ms=$(date -d "$(systemctl --user show meridian -p ActiveEnterTimestamp --value)" +%s 2>/dev/null || echo 0)
+    cs=$([ -f "$CREDS" ] && stat -c %Y "$CREDS" || echo 0)
+    if [ "$cs" -gt "$ms" ]; then warn "credentials ($(date -d @$cs '+%H:%M:%S')) newer than Meridian start ($(date -d @$ms '+%H:%M:%S')) — stale creds; will restart"; RESTART=1
+    else ok "Meridian started after the current credentials"; fi
+  else
+    warn "Meridian not active — will start it"; RESTART=1
+  fi
 fi
 
 if [ "$RESTART" = 1 ] && [ "$FAIL" = 0 ]; then
   hdr "6. Restart Meridian"
-  systemctl --user restart meridian && ok "restarted" || { err "restart failed"; FAIL=1; }
+  if [ "$IS_WSL" = 1 ]; then
+    # WSL: D-Bus session socket not accessible from non-login shell — kill + relaunch directly
+    warn "WSL detected — using direct restart (kill + nohup) instead of systemctl --user"
+    EXEC=$(grep '^ExecStart=' "$UNIT" 2>/dev/null | cut -d= -f2- | sed "s|%h|$HOME|g")
+    if [ -z "$EXEC" ]; then
+      err "Could not read ExecStart from $UNIT"; FAIL=1
+    else
+      pkill -f "$HOME/.npm-global/bin/meridian" 2>/dev/null || true
+      sleep 1
+      ENVFILE=$(grep '^EnvironmentFile=' "$UNIT" 2>/dev/null | cut -d= -f2- | sed "s|%h|$HOME|g")
+      if [ -f "$ENVFILE" ]; then
+        env $(grep -v '^#' "$ENVFILE" | xargs) nohup $EXEC >> "$HOME/.meridian.log" 2>&1 &
+      else
+        nohup $EXEC >> "$HOME/.meridian.log" 2>&1 &
+      fi
+      ok "Meridian launched directly (PID $!) — note: won't auto-restart on crash like the systemd service would"
+    fi
+  else
+    systemctl --user restart meridian && ok "restarted via systemctl" || { err "restart failed"; FAIL=1; }
+  fi
   for i in $(seq 1 15); do curl -fsS -m 2 "$MERIDIAN_URL/" >/dev/null 2>&1 && break; sleep 1; done
 else
   hdr "6. Restart Meridian"; ok "not needed"
