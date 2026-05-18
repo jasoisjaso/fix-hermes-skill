@@ -40,4 +40,3 @@ The script is **idempotent and safe to re-run**. It performs all 8 checks/repair
 
 - Overridable via env: `MERIDIAN_URL`, `HERMES_DIR`.
 - The script backs up `auth.json` to `auth.json.bak-<epoch>` before patching.
-- Using Meridian with a Max account violates Anthropic's Consumer ToS (Feb 2026); the user has accepted this risk — do not re-litigate it, just fix the breakage.
