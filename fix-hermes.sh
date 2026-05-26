@@ -4,11 +4,13 @@
 #
 # Background: Hermes talks to a local Meridian proxy (default :3456) which uses the
 # bundled Claude Code SDK so requests bill against the Claude Max plan. A claude.ai
-# re-auth breaks this two ways, both handled below:
+# re-auth can break this three ways, all handled below:
 #   (1) Meridian caches SDK credentials from before the re-auth -> restart it.
 #   (2) The re-auth re-imports the auth.json claude_code credential with
 #       base_url:null -> failover hits api.anthropic.com direct -> "third-party" 400.
-# This is NOT one-time: (2) recurs on EVERY re-auth, so we always re-patch.
+#       NOT one-time: recurs on EVERY re-auth; the auth-watcher daemon auto-heals this.
+#   (3) CLAUDE_CODE_OAUTH_TOKEN exported in a shell RC file (~/.bashrc etc) ->
+#       overrides Meridian routing every session -> persistent 401/400.
 
 set -uo pipefail
 
@@ -19,6 +21,8 @@ ENV_FILE="$HERMES_DIR/.env"
 CREDS="$HOME/.claude/.credentials.json"
 UNIT="$HOME/.config/systemd/user/meridian.service"
 SCRUB_PLUGINS="$HOME/.config/meridian/plugins.json"
+WATCHER_SCRIPT="$HERMES_DIR/auth-watcher.sh"
+SKILL_DIR="${CLAUDE_SKILL_DIR:-$HOME/.claude/skills/fix-hermes}"
 
 ok(){   printf '  \033[32m✔\033[0m %s\n' "$1"; }
 warn(){ printf '  \033[33m!\033[0m %s\n' "$1"; }
@@ -46,8 +50,13 @@ hdr "2. CLAUDE_CODE_OAUTH_TOKEN leak (must be unset everywhere)"
 leak=0
 [ -f "$UNIT" ]     && grep -q 'CLAUDE_CODE_OAUTH_TOKEN' "$UNIT"     && { err "set in $UNIT — remove that line"; leak=1; }
 [ -f "$ENV_FILE" ] && grep -q '^CLAUDE_CODE_OAUTH_TOKEN' "$ENV_FILE" && { err "set in $ENV_FILE — remove that line"; leak=1; }
-[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && { warn "set in current shell env (harmless for the service, but unset it)"; }
-[ "$leak" = 0 ] && ok "not set in meridian.service or ~/.hermes/.env" || FAIL=1
+# Shell RC files — the most common hidden cause; a token here bypasses Meridian every session
+for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc" "$HOME/.config/environment.d/"*.conf; do
+  [ -f "$rc" ] && grep -q 'CLAUDE_CODE_OAUTH_TOKEN' "$rc" && \
+    { err "set in $rc — remove that export line (causes Meridian bypass every shell session)"; leak=1; }
+done
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && { warn "set in current shell env — run: unset CLAUDE_CODE_OAUTH_TOKEN"; }
+[ "$leak" = 0 ] && ok "not set in meridian.service, ~/.hermes/.env, or shell RC files" || FAIL=1
 
 hdr "3. auth.json — re-patch base_url nulls + reset stale status"
 if [ -f "$AUTH_JSON" ]; then
@@ -133,7 +142,44 @@ else
   warn "hermes-scrub not registered in $SCRUB_PLUGINS — fingerprinting 400s may return"
 fi
 
-hdr "8. Live test through Meridian"
+hdr "8. auth-watcher daemon (auto-heals base_url after every token refresh)"
+# Install the watcher script if not already present
+if [ ! -f "$WATCHER_SCRIPT" ]; then
+  if [ -f "$SKILL_DIR/auth-watcher.sh" ]; then
+    cp "$SKILL_DIR/auth-watcher.sh" "$WATCHER_SCRIPT"
+    chmod +x "$WATCHER_SCRIPT"
+    ok "auth-watcher.sh installed to $WATCHER_SCRIPT"
+  else
+    warn "auth-watcher.sh not found in skill dir ($SKILL_DIR) — skipping daemon setup"
+  fi
+fi
+
+# Start the watcher if the script exists but isn't running
+if [ -f "$WATCHER_SCRIPT" ]; then
+  if ! pgrep -f "auth-watcher.sh" >/dev/null 2>&1; then
+    bash "$WATCHER_SCRIPT" >> /tmp/hermes-auth-watcher.log 2>&1 &
+    sleep 1
+    pgrep -f "auth-watcher.sh" >/dev/null \
+      && ok "auth-watcher started (PID $(pgrep -f auth-watcher.sh | head -1))" \
+      || warn "auth-watcher failed to start — check /tmp/hermes-auth-watcher.log"
+  else
+    ok "auth-watcher already running (PID $(pgrep -f auth-watcher.sh | head -1))"
+  fi
+
+  # Ensure .bashrc has the startup hook so watcher survives WSL restarts
+  BASHRC="$HOME/.bashrc"
+  if [ -f "$BASHRC" ] && ! grep -q "auth-watcher" "$BASHRC"; then
+    printf '\n# Auto-heal auth.json after Claude Code token refreshes (Hermes -> Meridian)\n' >> "$BASHRC"
+    printf 'if ! pgrep -f "auth-watcher.sh" > /dev/null 2>&1; then\n' >> "$BASHRC"
+    printf '  bash ~/.hermes/auth-watcher.sh >> /tmp/hermes-auth-watcher.log 2>&1 &\n' >> "$BASHRC"
+    printf 'fi\n' >> "$BASHRC"
+    ok "auth-watcher startup hook added to ~/.bashrc (survives WSL restart)"
+  elif grep -q "auth-watcher" "${BASHRC:-/dev/null}"; then
+    ok "auth-watcher startup hook already in ~/.bashrc"
+  fi
+fi
+
+hdr "9. Live test through Meridian"
 if [ "$FAIL" = 0 ]; then
   for attempt in 1 2 3; do
     RES=$(curl -s -m 60 "$MERIDIAN_URL/v1/messages" -H 'content-type: application/json' \
